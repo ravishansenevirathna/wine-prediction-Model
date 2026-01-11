@@ -1,0 +1,5 @@
+[core]
+    remote = winesetremote
+['remote "winesetremote"']
+    url = s3://winesetremote-bucket/wine-project
+    region = us-east-1
