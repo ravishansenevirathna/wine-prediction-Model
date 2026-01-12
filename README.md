@@ -8,6 +8,7 @@ A demo MLOps project demonstrating data versioning with DVC (Data Version Contro
 - [Project Architecture](#project-architecture)
 - [How DVC Works](#how-dvc-works)
 - [Real-World Scenario: Updating the Dataset](#real-world-scenario-updating-the-dataset)
+- [MLflow Production Architecture](#mlflow-production-architecture)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [DVC Remote Setup (S3)](#dvc-remote-setup-s3)
@@ -31,25 +32,28 @@ This project predicts wine quality based on various physicochemical properties u
 ## Project Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Wine Prediction Project                  │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       Wine Prediction Project                           │
+└─────────────────────────────────────────────────────────────────────────┘
 
-┌──────────────┐         ┌──────────────┐         ┌──────────────┐
-│   Git Repo   │         │  DVC Remote  │         │   MLflow     │
-│              │         │   (S3)       │         │  Tracking    │
-│  - Code      │         │              │         │              │
-│  - .dvc files│◄───────►│ - wine.csv   │         │ - Params     │
-│  - train.py  │         │ - Models     │         │ - Metrics    │
-│  - utils.py  │         │ - Artifacts  │         │ - Models     │
-└──────────────┘         └──────────────┘         └──────────────┘
-       │                        │                         │
-       │                        │                         │
-       └────────────────────────┼─────────────────────────┘
-                                │
+┌──────────────┐         ┌──────────────┐         ┌─────────────────────┐
+│   Git Repo   │         │  DVC Remote  │         │  MLflow (K8s Prod)  │
+│              │         │   (AWS S3)   │         │                     │
+│  - Code      │         │              │         │  ┌───────────────┐  │
+│  - .dvc files│◄───────►│ - wine.csv   │         │  │ MLflow Server │  │
+│  - train.py  │         │ - Models     │         │  │  (K8s Pod)    │  │
+│  - utils.py  │         │ - Artifacts  │         │  └───────┬───────┘  │
+└──────────────┘         └──────────────┘         │          │          │
+       │                        │                 │          ▼          │
+       │                        │                 │  ┌───────────────┐  │
+       └────────────────────────┼─────────────────┼► │  AWS RDS      │  │
+                                │                 │  │  PostgreSQL   │  │
+                                │                 │  │  (Metadata)   │  │
+                                │                 │  └───────────────┘  │
+                                │                 └─────────────────────┘
                                 ▼
                     ┌──────────────────────┐
-                    │  Local Environment   │
+                    │  Local/CI Environment│
                     │                      │
                     │  1. dvc pull         │
                     │  2. python train.py  │
@@ -57,12 +61,26 @@ This project predicts wine quality based on various physicochemical properties u
                     └──────────────────────┘
 ```
 
+### Production Architecture Components
+
+**Data Versioning (DVC + S3)**
+- **Git Repository**: Tracks code, configurations, and `.dvc` pointer files
+- **AWS S3**: Remote storage for datasets, models, and large artifacts
+- **DVC**: Manages data versioning and synchronization between local and S3
+
+**Experiment Tracking (MLflow Production)**
+- **MLflow Server**: Hosted as a containerized service in **Kubernetes cluster**
+- **AWS RDS PostgreSQL**: Backend database storing experiment metadata, parameters, metrics, and model registry
+- **Artifact Store**: Uses S3 for storing model artifacts and files
+- **High Availability**: Kubernetes provides auto-scaling, load balancing, and fault tolerance
+
 ### Workflow
 
 1. **Git** tracks code, configurations, and `.dvc` files (pointers to data)
 2. **DVC** manages large data files and stores them in S3
-3. **MLflow** logs experiments, parameters, and metrics
-4. **Train script** loads data, trains model, and logs to MLflow
+3. **MLflow** (production) logs experiments, parameters, and metrics to Kubernetes-hosted server
+4. **AWS RDS PostgreSQL** stores all MLflow metadata persistently
+5. **Train script** loads data from S3 via DVC, trains model, and logs to MLflow production server
 
 ---
 
@@ -342,6 +360,175 @@ This workflow ensures:
 
 ---
 
+## MLflow Production Architecture
+
+### Overview
+
+This project uses **production-grade MLflow** for experiment tracking, hosted in a **Kubernetes cluster** with **AWS RDS PostgreSQL** as the backend database. This setup provides enterprise-level reliability, scalability, and centralized experiment management.
+
+### Architecture Components
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                    MLflow Production Stack                       │
+└──────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│                  Kubernetes Cluster (AWS EKS)                   │
+│                                                                 │
+│  ┌────────────────────────────────────────────────────────┐     │
+│  │              MLflow Tracking Server                    │     │ 
+│  │              (Deployment + Service)                    │     │
+│  │                                                        │     │
+│  │  • Receives experiment logs from training jobs         │     │
+│  │  • Exposes REST API for tracking                       │     │
+│  │  • Serves MLflow UI (web interface)                    │     │
+│  │  • Manages model registry operations                   │     │
+│  └────────────────┬───────────────────────┬───────────────┘     │
+│                   │                       │                     │
+└───────────────────┼───────────────────────┼─────────────────────┘
+                    │                       │
+                    ▼                       ▼
+        ┌────────────────────┐   ┌──────────────────────┐
+        │   AWS RDS          │   │   AWS S3             │
+        │   PostgreSQL       │   │   Artifact Store     │
+        │                    │   │                      │
+        │ • Experiments      │   │ • Model files        │
+        │ • Runs             │   │ • Plots/images       │
+        │ • Parameters       │   │ • Datasets           │
+        │ • Metrics          │   │ • Custom artifacts   │
+        │ • Tags             │   │                      │
+        │ • Model Registry   │   └──────────────────────┘
+        └────────────────────┘
+                    ▲
+                    │
+        ┌───────────┴───────────┐
+        │  Training Jobs        │
+        │  (Local/CI/Airflow)   │
+        │                       │
+        │  python train.py      │
+        │  --experiment=wine    │
+        └───────────────────────┘
+```
+
+### Why Kubernetes + RDS PostgreSQL?
+
+**Kubernetes Benefits:**
+- **High Availability**: Auto-restart failed pods, maintain uptime
+- **Scalability**: Handle multiple concurrent experiments from different teams
+- **Load Balancing**: Distribute traffic across multiple MLflow server replicas
+- **Resource Management**: Control CPU/memory allocation for the tracking server
+- **Rolling Updates**: Zero-downtime deployments when updating MLflow
+
+**AWS RDS PostgreSQL Benefits:**
+- **Managed Service**: Automated backups, patching, and maintenance
+- **Durability**: Multi-AZ deployment for disaster recovery
+- **Performance**: Optimized for high transaction workloads (experiment logging)
+- **Scalability**: Vertical and horizontal scaling as experiment volume grows
+- **Security**: VPC isolation, encryption at rest and in transit
+
+### How It Works
+
+#### 1. Training Job Execution
+
+```python
+import mlflow
+import os
+
+# Point to production MLflow server
+mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI"))
+# Example: http://mlflow-service.ml-ops.svc.cluster.local:5000
+
+mlflow.set_experiment("wine-prediction")
+
+with mlflow.start_run(run_name="experiment-1"):
+    mlflow.log_param("n_estimators", 100)
+    mlflow.log_metric("rmse", 0.65)
+    mlflow.sklearn.log_model(model, "model")
+```
+
+#### 2. Data Flow
+
+```
+Training Script
+      │
+      │ (1) Send experiment data via REST API
+      ▼
+MLflow Server (K8s Pod)
+      │
+      ├─► (2) Store metadata → AWS RDS PostgreSQL
+      │       (params, metrics, tags, run info)
+      │
+      └─► (3) Store artifacts → AWS S3
+          (models, plots, files)
+```
+
+#### 3. Accessing Experiments
+
+**Via Web UI:**
+```bash
+# MLflow UI is accessible via Kubernetes Ingress/LoadBalancer
+# Example: https://mlflow.company.com
+```
+
+**Via API:**
+```python
+from mlflow.tracking import MlflowClient
+
+client = MlflowClient(tracking_uri="http://mlflow-k8s-url:5000")
+experiments = client.list_experiments()
+runs = client.search_runs(experiment_ids=["1"])
+```
+
+### Production Setup (Environment Variables)
+
+```bash
+# Set MLflow tracking URI to Kubernetes service
+export MLFLOW_TRACKING_URI="http://mlflow-service.ml-ops.svc.cluster.local:5000"
+
+# Or via external load balancer
+export MLFLOW_TRACKING_URI="https://mlflow.company.com"
+
+# Run training script
+python train.py --experiment wine-prediction
+```
+
+### Database Schema in RDS PostgreSQL
+
+The PostgreSQL database stores the following MLflow metadata:
+
+| Table | Description |
+|-------|-------------|
+| **experiments** | Experiment definitions and metadata |
+| **runs** | Individual experiment runs |
+| **params** | Hyperparameters logged for each run |
+| **metrics** | Performance metrics (RMSE, R², etc.) |
+| **tags** | Custom tags for organizing experiments |
+| **model_versions** | Model registry information |
+
+### Benefits of This Architecture
+
+1. **Centralized Tracking**: All team members log to the same MLflow server
+2. **Persistent Storage**: Experiments survive local machine failures
+3. **Collaboration**: Share experiments and models across the team
+4. **Scalability**: Handle hundreds of concurrent experiment runs
+5. **Security**: VPC-isolated RDS and role-based access control
+6. **Audit Trail**: Complete history of all experiments in PostgreSQL
+7. **Integration**: Works seamlessly with CI/CD pipelines (Jenkins, GitLab CI, Airflow)
+
+### Local Development vs Production
+
+| Aspect | Local Development | Production (K8s + RDS) |
+|--------|-------------------|------------------------|
+| **MLflow Server** | `mlflow ui` on localhost | Kubernetes Deployment |
+| **Database** | SQLite file | AWS RDS PostgreSQL |
+| **Artifacts** | Local filesystem | AWS S3 |
+| **Access** | http://localhost:7006 | https://mlflow.company.com |
+| **Scalability** | Single user | Multi-user, concurrent |
+| **Persistence** | Local only | Centralized, durable |
+
+---
+
 ## Prerequisites
 
 - Python 3.8+
@@ -543,13 +730,41 @@ python train.py \
 
 ### MLflow Tracking
 
-Start MLflow UI to view experiments:
+**Production Environment:**
+
+Access the MLflow UI via the Kubernetes-hosted server:
 
 ```bash
-mlflow ui --port 7006
+# Access via browser (URL provided by your DevOps team)
+# Example: https://mlflow.company.com
 ```
 
-Then open http://localhost:7006 in your browser.
+The tracking URI is set via environment variable:
+
+```bash
+export MLFLOW_TRACKING_URI="https://mlflow.company.com"
+# or internal K8s service URL
+export MLFLOW_TRACKING_URI="http://mlflow-service.ml-ops.svc.cluster.local:5000"
+```
+
+**Local Development:**
+
+For local development and testing, you can run MLflow locally:
+
+```bash
+# Start local MLflow UI
+mlflow ui --port 7006
+
+# Then open http://localhost:7006 in your browser
+```
+
+Set local tracking URI:
+
+```bash
+export MLFLOW_TRACKING_URI="http://localhost:7006"
+```
+
+The `train.py` script automatically uses the `MLFLOW_TRACKING_URI` environment variable (defaults to `http://localhost:7006` if not set).
 
 ### Updating the Dataset
 
@@ -605,15 +820,51 @@ Wine-Prediction-Model/
 
 ## Technologies Used
 
+### Core ML Stack
+
 | Technology | Purpose |
 |------------|---------|
-| **DVC** | Data version control and management |
-| **Git** | Code version control |
-| **AWS S3** | Remote storage for datasets and artifacts |
-| **MLflow** | Experiment tracking and model registry |
-| **scikit-learn** | Machine learning (Random Forest) |
-| **pandas** | Data manipulation |
+| **scikit-learn** | Machine learning (Random Forest Regressor) |
+| **pandas** | Data manipulation and preprocessing |
 | **NumPy** | Numerical operations |
+
+### MLOps Infrastructure
+
+| Technology | Purpose |
+|------------|---------|
+| **DVC** | Data version control and pipeline management |
+| **Git** | Code version control |
+| **AWS S3** | Remote storage for datasets and MLflow artifacts |
+| **MLflow** | Experiment tracking, model registry, and versioning |
+| **Kubernetes (K8s)** | Container orchestration for MLflow server |
+| **AWS RDS PostgreSQL** | Backend database for MLflow metadata storage |
+| **Docker** | Containerization of MLflow server |
+
+### Infrastructure Components
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   Technology Stack                      │
+└─────────────────────────────────────────────────────────┘
+
+Data Layer:
+  • AWS S3        → Datasets, models, artifacts
+  • DVC           → Version control for data
+
+Compute Layer:
+  • Python 3.8+   → Training scripts
+  • scikit-learn  → ML algorithms
+
+Tracking Layer:
+  • MLflow        → Experiment tracking
+  • Kubernetes    → MLflow hosting
+  • PostgreSQL    → Metadata storage
+  • AWS RDS       → Managed database
+
+Version Control:
+  • Git           → Code versioning
+  • DVC           → Data versioning
+```
 
 ---
 
